@@ -105,6 +105,14 @@ etcd 并没有直接使用 bbolt 的事务，而是基于 bbolt 实现的。
             }
 ```
 
+### 如何提高 txWrite 和 txRead 的并发度
+
+我们知道 txWrite 和 txRead 的执行过程中，都会涉及一些共享资源，比如 index tree, read buffer 等。如何避免读写事务的冲突呢？<br>
+
+一种简单的思路是，维护一个 store 粒度的互斥锁，读写事务都需要占有这个锁。显然，这种方式的并发度太低了，那应该怎么办呢？<br>
+
+虽然共享资源是免不了加锁的，但我们可以将锁的粒度变小。比如 index tree 定义一个锁，read buffer 定义一个锁。这样在访问具体的资源的时候，才需要互斥。提高系统并发度。
+
 ### store
 
 store 包括：index 和 backend 两个部分。etcd 的 mvcc 就是基于 index 实现的。
@@ -238,8 +246,42 @@ const (
     压缩过程需要遍历整个 index tree，删除多余的数据，同时还需要删除 bbolt 对应的数据。当涉及的数据很多的时候，必然会影响到正常的读写事务，如何尽量降低对普通的读写事务的影响呢？<br>
 
     对于 index tree，核心思路是将 tree 维度的锁降低到 tree item 维度的锁。实现方法是先 clone 一个 index tree，然后遍历该 clone tree，对于每一个 item，加 origin index tree 的锁，调整完毕后，释放锁。在压缩 index 的期间，origin tree index 可能会插入一些新的 item，**但这些 item 对应的 revision 一定比 compact_revision 新，所以我们没必要处理该数据。**<br>
+  
+  - 如何 clone index tree 呢？
+  
+    通常的思路就是加一个 tree 维度的锁，然后逐个 item copy，copy 完之后，释放锁。但是，这种方式 copy 性能比较差，而且 copy 期间，会阻塞其他正常的读写请求。<br>
+    
+    而 etcd 引用的 btree 开源库，用了一个很妙的解法：**tree 是只读的，如果要修改，那就 copy-on-write，这样 clone 的时候只要获取到 root 信息即可**。<br>
+  
+    btree clone 的代码如下，我们需要重点关注 comment 部分：
+```go
+// Clone clones the btree, lazily.  Clone should not be called concurrently,
+// but the original tree (t) and the new tree (t2) can be used concurrently
+// once the Clone call completes.
+//
+// The internal tree structure of b is marked read-only and shared between t and
+// t2.  Writes to both t and t2 use copy-on-write logic, creating new nodes
+// whenever one of b's original nodes would have been modified.  Read operations
+// should have no performance degredation.  Write operations for both t and t2
+// will initially experience minor slow-downs caused by additional allocs and
+// copies due to the aforementioned copy-on-write logic, but should converge to
+// the original performance characteristics of the original tree.
 
-   当压缩完 index tree 后， 我们获得一个 valid revision 集合。然后会加 batchTx 的锁，更改 bbolt。但这里为了降低对正常读写事务的影响，通过分批的方式来压缩 bbolt，每次只压缩指定数量的数据。 
+func (t *BTree) Clone() (t2 *BTree) {
+	// Create two entirely new copy-on-write contexts.
+	// This operation effectively creates three trees:
+	//   the original, shared nodes (old b.cow)
+	//   the new b.cow nodes
+	//   the new out.cow nodes
+	cow1, cow2 := *t.cow, *t.cow
+	out := *t
+	t.cow = &cow1
+	out.cow = &cow2
+	return &out
+}
+```
+
+当压缩完 index tree 后， 我们获得一个 valid revision 集合。然后会加 batchTx 的锁，更改 bbolt。但这里为了降低对正常读写事务的影响，通过分批的方式来压缩 bbolt，每次只压缩指定数量的数据。 
 
 ## consistent index
 
