@@ -169,3 +169,7 @@ bbolt 允许同时存在多个读事务。每个读事务被创建的时候，�
     当当前的 freePage 不够时候，bbolt 就会 unmap 掉原来的映射，并通过 mmap(memory map) 的方式扩展 db 文件大小. 这里的问题是原来的 mmap 区可能还有读事务在访问，那什么时候才能 unmap 呢？
 
     bbolt 会通过一把 db 的全局读写锁来保证 mmap 的互斥，每当创建一个读事务的时候，就会持有一个读锁，当需要重新 mmap() 的时候，会获取写锁，进而保证两者的同步。
+
+# B+ Tree rebalance
+
+TODO: 看看写事务提交的时候是如何 rebalance 的

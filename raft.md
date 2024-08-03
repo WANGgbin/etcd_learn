@@ -184,9 +184,9 @@ WAL 还有一类类型为 HardState 的 entry，内部包含 commited_index、te
 
 ### 已经 commit 但是 apply 失败，然后服务重启，重放 commit 有没有可能 apply 成功，这不就不一致了 ？
 
-    etcd 在 apply 的时候如果发生错误，对于**写**操作(只有写操作，才会有 entry)如果发生的错误是稳定的，比如 key 不存在、lease 不存在，那么即使重放该 entry，结果也一定是可预见的。而对于一些结果不稳定的错误，本次失败但下次可能成功的 entry，服务直接 panic，或者一些严重的服务内容的错误直接 panic。<br>
+etcd 在 apply 的时候如果发生错误，对于**写**操作(只有写操作，才会有 entry)如果发生的错误是稳定的，比如 key 不存在、lease 不存在，那么即使重放该 entry，结果也一定是可预见的。而对于一些结果不稳定的错误，本次失败但下次可能成功的 entry，服务直接 panic，或者一些严重的服务内容的错误直接 panic。<br>
 
-    在 etcd 内部，我们可以见到很多发生错误直接 panic 的情况，一些场景下，要保证几个操作之间的原子性，如果中间某一步发生错误，也直接 panic。
+在 etcd 内部，我们可以见到很多发生错误直接 panic 的情况，一些场景下，要保证几个操作之间的原子性，如果中间某一步发生错误，也直接 panic。
 
 ## 日志复制
 
@@ -229,6 +229,45 @@ func (l *raftLog) findConflictByTerm(index uint64, term uint64) uint64 {
 	return index
 }
 ```
+
+## server 从 raft 拿到一个 entry，怎么区分底层到底对应哪个 req 呢？
+
+server 收到一个 client 的请求后，如果是一个写操作，会将该请求 Propose 给 raft 层，raft 层会将 req 转化为一个 entry，当该 entry 在集群中得到共识后，就会 apply 到 server，
+可是这个时候，server 看到的是一个 []byte，怎么区分该 entry 到底对应哪种类型的 req 呢？<br>
+
+如果直接把 req marshal 存到 entry 后，会丢失 req 类型信息，也就无法区分 req 类型。etcd 的做法是，会在 raw req 基础上，定义一个 InternalRaftRequest 类型，该类型定义如下：
+```go
+type InternalRaftRequest struct {
+    Header                   *RequestHeader                            `protobuf:"bytes,100,opt,name=header,proto3" json:"header,omitempty"`
+    ID                       uint64                                    `protobuf:"varint,1,opt,name=ID,proto3" json:"ID,omitempty"`
+    Range                    *RangeRequest                             `protobuf:"bytes,3,opt,name=range,proto3" json:"range,omitempty"`
+    Put                      *PutRequest                               `protobuf:"bytes,4,opt,name=put,proto3" json:"put,omitempty"`
+    DeleteRange              *DeleteRangeRequest                       `protobuf:"bytes,5,opt,name=delete_range,json=deleteRange,proto3" json:"delete_range,omitempty"`
+    Txn                      *TxnRequest                               `protobuf:"bytes,6,opt,name=txn,proto3" json:"txn,omitempty"`
+    Compaction               *CompactionRequest                        `protobuf:"bytes,7,opt,name=compaction,proto3" json:"compaction,omitempty"`
+    LeaseGrant               *LeaseGrantRequest                        `protobuf:"bytes,8,opt,name=lease_grant,json=leaseGrant,proto3" json:"lease_grant,omitempty"`
+	// ...
+}
+```
+
+可以看到内部每一个成员对应一种类型的请求。<br>
+
+接着，在 server 处理 req 的入口处，会基于每一个 raw req，封装一个 InternalRaftRequest 请求，比如 DeleteRange 处理如下：
+```go
+func (s *EtcdServer) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
+	// 我们看到这里会包装生成一个 InternalRaftRequest，有什么作用呢？
+	// sever 最后 apply 的数据是从 raft 层拿到的，如果这里不包装成 InternalRaftRequest，
+	// server 就无法区分从 raft 获取到的 entry 到底对应哪个请求。
+	// 而如果这么包装后，server unmarshal 后，哪个成员非空，那就对应哪个类型的请求。
+	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{DeleteRange: r})
+	if err != nil {
+		return nil, err
+	}
+	return resp.(*pb.DeleteRangeResponse), nil
+}
+```
+
+这样对 InternalRaftRequest marshal 后，其实保留了 raw req 的类型信息，后续 entry apply 到 server 的时候，只需要 unmarshal，然后依次编译每一个成员，取第一个非空的即可。
 
 # leader 选举
 
