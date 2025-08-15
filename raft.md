@@ -71,7 +71,6 @@
 - 实现
 
     etcd 线性读的实现很巧妙。会拉起一个后台协程，该协程要做的就是，每一轮新建一个 ch，然后从 leader 获取 commited_index，然后使用 etcd 的 waitTime 机制阻塞，直到本地 applied_index >= commited_index，最后关闭本轮的 ch。<br>
-
     而请求端首先获取 ch，然后再 ch 阻塞，直到 ch 被关闭。
 
 # 成员管理
@@ -80,28 +79,28 @@
 
 etcd 基于 raft 实现强一致性，raft 是**容错的共识算法**。所谓容错，是指可以容忍集群中若干节点的 crash，共识算法指的是就某一点能在集群中达成共识。<br>
 
-而全序关系广播是实现共识的一种思路，而**日志**是实现全序关系广播的一种具体实现。etcd raft 就是通过 log 实现共识的。<br>
+而全序关系广播是实现共识的一种思路，而**日志**是全序关系广播的一种具体实现。etcd raft 就是通过 log 实现共识的。<br>
 
 - 整体架构
 
 我们以一个写流程来串联下日志同步的整个流程。注意：**并不是所有请求都需要过 raft 共识层，比如读请求**。<br>
 
-    - 客户端发送写请求
-    - 服务端收到后，将请求封装为一个 log entry，扔给 raft 层
-    - raft 给此 log entry 分配一个 term 以及 index，注意此时 entry 尚未持久化，还在 unstable storage(内存) 中
-    - 通过 raft 层提供的 Ready 接口，将分配好 term 和 index 的 entry 返回给 app
-    - 因为 etcd raft 没有实现网络层、持久层，这些是在 etcd 的 app 层实现的，etcd 在 raft 层往上又封装了一个完整的 raft(包括持久层(wal)、网络层(raft_http)), etcd_raft 通过 raft 的 Ready 接口获取到 entry，然后进行持久化，同时发送 entries 给各个 follower。
-    - follower 接收到 entries 后，会扔到自己的 unstable storage 中。然后发送 MsgAppResp 给 leader。
-    - leader 收到响应后，根据所有 follower 的 match 信息更新 comitted_index，然后通过 Ready 接口将已经 commited_index 但是尚未 applied_index 的 entries 发送给 etcd_raft
-    - etcd_raft 将 entries 通过 applyC ch 发送给 server
-    - server 结束 entries，然后根据 consistent_index 实现幂等，获取已经 apply 的 entry，然后 apply 其他 entry
-    - 当 entry apply 后，会给写请求对应的 ch 发送一个响应，服务端入口从 ch 接受这个响应，然后返回给客户端。
+  - 客户端发送写请求
+  - 服务端收到后，将请求封装为一个 log entry，扔给 raft 层
+  - raft 给此 log entry 分配一个 term 以及 index，注意此时 entry 尚未持久化，还在 unstable storage(内存) 中
+  - 通过 raft 层提供的 Ready 接口，将分配好 term 和 index 的 entry 返回给 app
+  - 因为 etcd raft 没有实现网络层、持久层，这些是在 etcd 的 app 层实现的，etcd 在 raft 层往上又封装了一个完整的 raft(包括持久层(wal)、网络层(raft_http)), etcd_raft 通过 raft 的 Ready 接口获取到 entry，然后进行持久化，同时发送 entries 给各个 follower。
+  - follower 接收到 entries 后，会扔到自己的 unstable storage 中。然后发送 MsgAppResp 给 leader。
+  - leader 收到响应后，根据所有 follower 的 match 信息更新 committed_index，然后通过 Ready 接口将已经 commited_index 但是尚未 applied_index 的 entries 发送给 etcd_raft
+  - etcd_raft 将 entries 通过 applyC ch 发送给 server
+  - server 接受 entries，然后根据 consistent_index 实现幂等，获取已经 apply 的 entry，然后 apply 其他 entry
+  - 当 entry apply 后，会给写请求对应的 ch 发送一个响应，服务端入口从 ch 接受这个响应，然后返回给客户端。
 
 ## unstable log
 
 为什么要有 unstable log 呢？当接收到一个 entry 的时候，为什么不直接存到 WAL 中呢？实际上是为了**性能考虑**。不管是 client request 持久化到 leader 或者是 leader 广播到 follower，如果都是持久化 WAL，带来的必然是性能问题。<br>
 
-所以提供了一个内存 buf: unstable log。entry 首先存储到 unstable log，然后再批量持久化到 WAL，这样可以提高系统整体性能。<br>
+所以提供了一个内存 buf: unstable log。entry 首先存储到 unstable log，然后再**批量**持久化到 WAL，这样可以提高系统整体性能。<br>
 
 既然是内存 buf，那就有丢失的可能。如果 server crash 重启了怎么办？其实也没啥问题，因为集群中的其他节点保存了这些 entry。如果是 leader crash，则重启后，从新的 leader 同步 entry，如果是 follower 重启，直接从 leader 节点同步 entry.<br>
 
@@ -111,7 +110,7 @@ etcd 基于 raft 实现强一致性，raft 是**容错的共识算法**。所谓
 
 ### 什么时候删除 WAL 中的日志
 
-实际上当 wal 中的 entry applied 以后就没必要存储了，因为这些 entry 对应的变更已经存储到 db 了。 etcd 默认当 applied_index - sanp_index > 10000 的时候，就会生成快照 <br>
+实际上当 wal 中的 entry applied 以后就没必要存储了，因为这些 entry 对应的变更已经存储到 db 了。 etcd 默认当 applied_index - snap_index > 10000 的时候，就会生成快照 <br>
 
 那么如何生成快照呢？我们直接看代码：
 ```go
@@ -204,7 +203,6 @@ leader 为每一个 follower 维护了进度信息，包括 match: match 日志�
 
     如果 follower 落后 leader 很多（对应的日志已被 leader compact，在 raftlog 中不存在），此时，就只能发送 snapshot 给 follower，对应的复制状态就是 snapshot。
 
-
 - replication
 
     follower 落后的日志都可以在 leader raftlog 中找到，表示落后不是很多也就是正常的复制状态，即 replication。
@@ -215,7 +213,10 @@ follower 的复制状态就在上面三个状态之间转移。
 
 首先一个总原则：日志的每个 entry 包括两个要素：index、term。日志的 index 是递增的，日志的 term 也是递增的。<br>
 
-leader 给 follower 发送 MsgApp 消息时，除了发送 entries，还会**发送第一个 entry 的前一个 entry 的 index 和 term**，follower 接收到 MsgApp 后，首先会判断这个特定 entry 的 index 和 term 能否匹配，如果不能即表示存在冲突。随后，follower 会在 MsgAppResp 中带上该 index 处的 term，leader 收到后，通过下面的逻辑调整下一次 MsgApp 的起始位置：
+leader 给 follower 发送 MsgApp 消息时，除了发送 entries，还会**发送第一个 entry 的前一个 entry 的 index 和 term**，follower 接收到 MsgApp 后，
+首先会判断这个特定 entry 的 index 和 term 能否匹配，如果不能即表示存在冲突。随后，follower 会在 MsgAppResp 中带上该 index 处的 term，leader 收到后，
+通过下面的逻辑调整下一次 MsgApp 的起始位置：
+
 ```go
 // 从 index 回溯，直到某个 index 的 term <= term，因为 > term 的 index 一定是冲突的。
 func (l *raftLog) findConflictByTerm(index uint64, term uint64) uint64 {
@@ -229,6 +230,15 @@ func (l *raftLog) findConflictByTerm(index uint64, term uint64) uint64 {
 	return index
 }
 ```
+
+### 日志同步模型
+
+etcd 中的日志同步是通过 leader 主动推送的方式实现的，而不是 follower 主动拉取。
+
+raft 之间的通信通过 rafthttp 实现。raft http 为每个 peer 维护了一个 peer 对象，每个 peer 对应一个 streamWriter 和 streamReader，
+streamWriter 负责发送不断发送消息给对端，streamReader 负责从对端接受 resp。
+
+而上层(raft, raft 没有网络通信能力，通过 raft http 实现)直接将消息发送给 streamWriter 的 writec，streamWriter 从 writec 接受数据并发送给对端。
 
 ## server 从 raft 拿到一个 entry，怎么区分底层到底对应哪个 req 呢？
 
@@ -301,11 +311,11 @@ func (s *EtcdServer) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) 
 
 ## term
 
-term 类似于 kafka 中的 epoch(纪元)，每当发生 leader 切换的时候，term + 1。
+term 类似于 kafka 中的 epoch(纪元)，每当发生 leader 切换的时候，term + 1。用来充当逻辑时钟，识别旧的请求、旧的 leader。
 
 ## leader 切换流程
 
-每个 follower 维护一个 election 超时时间，每当接收到来自 leader 的消息的时候，该超时时间重启及时，当超过 election 超时时间后，follower 会发起选举流程，自身状态切换为 candidate。<br>
+每个 follower 维护一个 election 超时时间，每当接收到来自 leader 的消息的时候，该超时时间 reset，当超过 election 超时时间后，follower 会发起选举流程，自身状态切换为 candidate。<br>
 
 自身的 term + 1，给自己投票，然后给集群中的所有其他节点(集群节点通过 progress 维护)发送投票消息，其他节点收到后，会根据以下条件判断是否投票：
 
@@ -313,7 +323,8 @@ term 类似于 kafka 中的 epoch(纪元)，每当发生 leader 切换的时候�
 - 自己在当前 term 有没有投过票
 - 发起选举的节点的 entry 是不是跟自己相同或者比自己新
 
-只有条件都成立时，才给该节点投票，否则投反对票。当发起投票的节点接收到的赞成票 >= 集群 qurnum( n/2 + 1) 的时候，就切换为 leader，其他节点收到该 leader 的任意消息的时候，更改自身维护的 leader_id。如果大多数节点都投了反对票，则节点切换为 follower，并在 election timeout 后发起新一轮选举，除非在此期间收到了新 leader 的消息。<br>
+只有上述条件都成立时，才给该节点投票，否则投反对票。当发起投票的节点接收到的赞成票 >= 集群 qurnum( n/2 + 1) 的时候，就切换为 leader，
+其他节点收到该 leader 的任意消息的时候，更改自身维护的 leader_id。如果大多数节点都投了反对票，则节点切换为 follower，并在 election timeout 后发起新一轮选举，除非在此期间收到了新 leader 的消息。<br>
 
 如果同一时间有多个 follower 发起了 选举怎么办？这样选举成功的概率就比较低，紧接这会发起新的一轮选举，周而复始。<br>
 
@@ -331,7 +342,8 @@ preVote 就是预投票的意思，提前进行一次投票，如果投票可以
 
 集群中节点信息当然要在各个节点达成一致，etcd 也是通过日志的方式来同步集群变更信息的。每当集群中增加/删除 节点的时候，就会生成一个 ConfChange 类型的 entry，然后 apply 到集群的各个节点。<br>
 
-其实在新建集群的时候，也会针对集群中的每个节点生成一个 entry，然后在集群所有节点 apply。这里就有一个问题，在搭建集群的过程中，是还没有 leader 的，而日志同步时通过 leader 发送给 follower 的方式进行的，那怎么同步呢？当节点 crash/net partition 的时候，leader 又是如何感知的呢？<br>
+其实在新建集群的时候，也会针对集群中的每个节点生成一个 entry，然后在集群所有节点 apply。这里就有一个问题，在搭建集群的过程中，是还没有 leader 的，
+而日志同步是通过 leader 发送给 follower 的方式进行的，那怎么同步呢？当节点 crash/net partition 的时候，leader 又是如何感知的呢？<br>
 
 当集群中的节点启动的时候，是能知道 cluster 都有哪些节点的，只需要对每个节点生成一个 entry 然后 apply 即可，这样所有节点的 entry 信息都是一致，并不需要通过 leader 的方式同步。<br>
 

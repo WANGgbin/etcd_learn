@@ -119,9 +119,18 @@ store 包括：index 和 backend 两个部分。etcd 的 mvcc 就是基于 index
 
 #### index
 
-etcd 的 store 会维护一个全局的逻辑时钟，也就是版本号：revision。当 etcd 有写入操作的时候：新增、变更、删除，都会生成一个新的版本，并以此版本号为 key，以业务的 key、value、create_revision、mod_revision 等信息为 value 存入到 bbolt 中。<br>
+store 基于 bbolt 实现，而我们知道 bbolt 底层通过 B+ 树存储数据。 那么这个 B+ 树的 key、value 是什么呢？
 
-而这就是 etcd 实现 mvcc 特性的关键，而 mvcc 是实现快照读的关键。那么 store 是如何存储 key 到 revision 的映射呢？就是通过 B Tree，这是一个存内存数据结构，当 server restart 的时候，基于 bbolt 重建 B Tree。
+etcd 的 store 会维护一个全局的逻辑时钟，也就是版本号：revision。当 etcd 有写入操作的时候：新增、变更、删除，
+都会生成一个新的版本，并以此版本号为 key，以业务的 key、value、create_revision、mod_revision 等信息为 value 存入到 bbolt 中。
+为什么要以这个版本号为 key?
+因为这样能保证数据总是查入到 B+ 树末尾的，避免了中间插入导致的页分裂进而导致的性能问题。
+
+可是这带来的问题是，没法通过业务 key 来查找数据。需要一种方式能够根据业务 key 查询到 B+ 树的 key(revision)，再从 B+ 树查找数据。
+这不就是从业务 key 到 revision 的索引吗？那就加个索引好了。而这个索引就是 index tree，index tree 本质是个 B 树(个人感觉跳表应该也可以)，
+key 就是业务 key，而 value 是个列表，包含这个 key 所有的版本信息。这是一个存内存数据结构，当 server restart 的时候，基于 bbolt 重建 B Tree。
+
+而这个 revision 列表就是 etcd 实现 mvcc 特性的关键，而 mvcc 是实现快照读的关键。
 
 #### revision
 
